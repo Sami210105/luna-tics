@@ -1,0 +1,9 @@
+numpy==1.26.4
+scipy
+opencv-python
+pillow
+rasterio
+planetaryimage
+torch
+transformers
+requests
