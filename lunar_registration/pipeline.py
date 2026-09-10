@@ -42,6 +42,7 @@ import warnings
 from typing import Optional, Tuple
 
 import numpy as np
+import cv2
 
 from .config import PipelineConfig, get_sensor_config
 from .preprocessing import load_image, load_angle_maps, LoadedImage
@@ -59,6 +60,111 @@ def _parse_window(s: Optional[str]) -> Optional[Tuple[int, int, int, int]]:
         return None
     x, y, w, h = (int(v) for v in s.split(","))
     return x, y, w, h
+
+
+def filter_eloftr_with_pwift(pwift_result, eloftr_result, cfg: PipelineConfig):
+    """Approach A: PWIFT-only geometry filters EfficientLoFTR, then fuse."""
+    if pwift_result is None or eloftr_result is None:
+        return None
+
+    if len(pwift_result.pts_src) < 4 or len(eloftr_result.pts_src) == 0:
+        return None
+
+    prior_threshold = float(
+        getattr(cfg, "pwift_eloftr_prior_threshold_px", 5.0)
+    )
+    dedupe_radius = float(
+        getattr(cfg, "pwift_eloftr_dedupe_radius_px", 2.0)
+    )
+
+    # Preliminary model comes ONLY from PWIFT.
+    H_pwift, pwift_inliers = cv2.findHomography(
+        pwift_result.pts_src.astype(np.float32),
+        pwift_result.pts_dst.astype(np.float32),
+        cv2.RANSAC,
+        float(cfg.ransac_reproj_threshold_px),
+        maxIters=int(cfg.ransac_max_iters),
+        confidence=float(cfg.ransac_confidence),
+    )
+
+    if H_pwift is None or pwift_inliers is None:
+        warnings.warn("PWIFT -> LoFTR fusion skipped: no PWIFT homography.")
+        return None
+
+    if int(np.count_nonzero(pwift_inliers)) < 4:
+        warnings.warn("PWIFT -> LoFTR fusion skipped: fewer than 4 PWIFT inliers.")
+        return None
+
+    src_l = eloftr_result.pts_src.astype(np.float32)
+    dst_l = eloftr_result.pts_dst.astype(np.float32)
+
+    predicted = cv2.perspectiveTransform(
+        src_l.reshape(-1, 1, 2), H_pwift
+    ).reshape(-1, 2)
+
+    error = np.linalg.norm(predicted - dst_l, axis=1)
+    keep = np.isfinite(error) & (error <= prior_threshold)
+
+    n_prior = int(keep.sum())
+
+    # Remove LoFTR correspondences already represented by PWIFT anchors.
+    candidate_idx = np.flatnonzero(keep)
+    if len(candidate_idx):
+        src_delta = (
+            src_l[candidate_idx, None, :]
+            - pwift_result.pts_src[None, :, :]
+        )
+        dst_delta = (
+            dst_l[candidate_idx, None, :]
+            - pwift_result.pts_dst[None, :, :]
+        )
+
+        duplicate = (
+            np.linalg.norm(src_delta, axis=2) <= dedupe_radius
+        ) & (
+            np.linalg.norm(dst_delta, axis=2) <= dedupe_radius
+        )
+        keep[candidate_idx] &= ~np.any(duplicate, axis=1)
+
+    kept = np.flatnonzero(keep)
+
+    fused_src = np.concatenate(
+        [pwift_result.pts_src, src_l[kept]], axis=0
+    ).astype(np.float32)
+    fused_dst = np.concatenate(
+        [pwift_result.pts_dst, dst_l[kept]], axis=0
+    ).astype(np.float32)
+
+    pwift_scores = (
+        pwift_result.scores
+        if pwift_result.scores is not None
+        else np.ones(len(pwift_result.pts_src), dtype=np.float32)
+    )
+    loftr_scores = (
+        eloftr_result.scores[kept]
+        if eloftr_result.scores is not None
+        else np.ones(len(kept), dtype=np.float32)
+    )
+    fused_scores = np.concatenate(
+        [pwift_scores, loftr_scores], axis=0
+    ).astype(np.float32)
+
+    from .matching import MatchResult
+
+    print(
+        f"[FUSION] PWIFT anchors: {len(pwift_result.pts_src)} | "
+        f"LoFTR candidates: {len(eloftr_result.pts_src)} | "
+        f"within PWIFT prior: {n_prior} | "
+        f"after dedupe: {len(kept)} | "
+        f"fused: {len(fused_src)}"
+    )
+
+    return MatchResult(
+        "pwift_eloftr_fused",
+        fused_src,
+        fused_dst,
+        fused_scores,
+    )
 
 
 def run_pipeline(
@@ -81,6 +187,7 @@ def run_pipeline(
     source_window: Optional[Tuple[int, int, int, int]] = None,
     reference_window: Optional[Tuple[int, int, int, int]] = None,
     use_eloftr: bool = True,
+    fuse_pwift_eloftr: bool = False,
     cfg: Optional[PipelineConfig] = None,
 ) -> dict:
     cfg = cfg or PipelineConfig()
@@ -187,8 +294,15 @@ def run_pipeline(
         src_illum, src_scaled, ref_illum, ref.data, cfg, use_eloftr=use_eloftr,
     )
 
+    # Approach A: use PWIFT geometry to filter LoFTR, then fuse.
+    fused_result = None
+    if fuse_pwift_eloftr and eloftr_result is not None:
+        fused_result = filter_eloftr_with_pwift(
+            pwift_result, eloftr_result, cfg
+        )
+
     results_by_method = {}
-    for match_result in [pwift_result, eloftr_result]:
+    for match_result in [pwift_result, eloftr_result, fused_result]:
         if match_result is None or len(match_result.pts_src) < 4:
             continue
         # ---- Stage 4: viewpoint (homography + RANSAC) ----
@@ -322,6 +436,13 @@ def main():
         help="Reference-image crop x,y,w,h (recommended for geometry-selected LROC overlap).",
     )
     parser.add_argument("--no-eloftr", action="store_true")
+    parser.add_argument(
+        "--fuse-pwift-eloftr",
+        action="store_true",
+        help="Approach A: filter EfficientLoFTR using a PWIFT-only "
+             "preliminary homography, then fuse surviving LoFTR matches "
+             "with PWIFT anchors before final RANSAC.",
+    )
     args = parser.parse_args()
 
     summary = run_pipeline(
@@ -340,6 +461,7 @@ def main():
         source_window=_parse_window(args.source_window),
         reference_window=_parse_window(args.reference_window),
         use_eloftr=not args.no_eloftr,
+        fuse_pwift_eloftr=args.fuse_pwift_eloftr,
     )
     print(json.dumps(summary, indent=2))
 

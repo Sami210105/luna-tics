@@ -614,6 +614,128 @@ def compute_bichannel_descriptors(
     return descriptors
 
 
+# ----------------------------------------------------------------------
+# 4c. Contextual (surrounding-terrain) descriptor - NOT in the paper.
+#     Addresses the "two craters with near-identical local appearance but
+#     different surroundings" ambiguity by encoding what's AROUND the
+#     keypoint's own patch, not just inside it.
+# ----------------------------------------------------------------------
+
+def compute_context_descriptor(
+    keypoints: List[Keypoint], M_PW: np.ndarray, mask: np.ndarray,
+    n_rings: int = 3, n_sectors: int = 8, ring_spacing_px: int = 24,
+) -> np.ndarray:
+    """For each keypoint, samples mean M_PW structural energy in a set of
+    concentric rings x angular sectors extending OUTWARD from the
+    keypoint - i.e. "is there a ridge to the upper-left, a second crater
+    further out, open flat terrain" - rather than what the local
+    descriptor patch already covers. Sampled relative to the keypoint's
+    own dominant orientation (same rotation-normalization convention as
+    Eq 12), so it stays comparable across images at different rotations.
+
+    Returns an (N, n_rings*n_sectors) float32 array, L2-normalized per row.
+    Independent of `compute_bichannel_descriptors` - meant to be combined
+    with its output at matching time (see `swap_aware_match_with_context`),
+    not concatenated into the same 384-dim vector, since it has a
+    different physical meaning (surroundings, not local appearance) and
+    mixing it into one L2 norm would let one dominate the other
+    unpredictably depending on relative magnitude."""
+    h, w = M_PW.shape
+    n_cells = n_rings * n_sectors
+    out = np.zeros((len(keypoints), n_cells), dtype=np.float32)
+    max_radius = n_rings * ring_spacing_px
+    sector_width = 2 * np.pi / n_sectors
+
+    for i, kp in enumerate(keypoints):
+        xi, yi = int(round(kp.x)), int(round(kp.y))
+        y0, y1 = max(0, yi - max_radius), min(h, yi + max_radius)
+        x0, x1 = max(0, xi - max_radius), min(w, xi + max_radius)
+        if y1 <= y0 or x1 <= x0:
+            continue
+
+        patch = M_PW[y0:y1, x0:x1]
+        pm = mask[y0:y1, x0:x1]
+        ys, xs = np.mgrid[y0:y1, x0:x1]
+        dx = (xs - xi).astype(np.float32)
+        dy = (ys - yi).astype(np.float32)
+
+        # rotate into the keypoint's own canonical frame - same convention
+        # as Eq 12's xr/yr, so "upper-left" means the same thing relative
+        # to local structure in both images being compared
+        theta = kp.orientation
+        xr = np.cos(theta) * dx - np.sin(theta) * dy
+        yr = np.sin(theta) * dx + np.cos(theta) * dy
+
+        r = np.sqrt(xr ** 2 + yr ** 2)
+        ang = (np.arctan2(yr, xr) + 2 * np.pi) % (2 * np.pi)
+        ring_idx = np.clip((r // ring_spacing_px).astype(int), 0, n_rings - 1)
+        sector_idx = np.clip((ang // sector_width).astype(int), 0, n_sectors - 1)
+        cell_idx = (ring_idx * n_sectors + sector_idx)
+
+        valid = pm & (r > 0) & (r < max_radius)
+        vec = np.zeros(n_cells, dtype=np.float32)
+        counts = np.zeros(n_cells, dtype=np.float32)
+        np.add.at(vec, cell_idx[valid], patch[valid])
+        np.add.at(counts, cell_idx[valid], 1.0)
+        vec = vec / np.maximum(counts, 1.0)  # mean energy per cell
+
+        norm = np.linalg.norm(vec)
+        if norm > 1e-6:
+            vec = vec / norm
+        out[i] = vec
+
+    return out
+
+
+def swap_aware_match_with_context(
+    desc_a: List[BiChannelDescriptor], desc_b: List[BiChannelDescriptor],
+    context_a: np.ndarray, context_b: np.ndarray,
+    no: int = 4, nbins: int = 12, ratio_test: float = 0.85, context_weight: float = 0.3,
+) -> List[Match]:
+    """Same swap-aware distance as `swap_aware_match` (Eq 19-21), plus a
+    weighted contextual-distance term. Both terms come from L2-normalized
+    vectors, so both are on a comparable [0, ~1.4] scale and a linear blend
+    is meaningful without extra rescaling. `context_weight=0` reduces
+    exactly to `swap_aware_match`; start low (0.2-0.3) and increase only if
+    it measurably improves inlier ratio - a large weight will start
+    penalizing genuinely correct matches near two similar-looking features
+    just because their surroundings were sampled slightly differently."""
+    if not desc_a or not desc_b:
+        return []
+    from scipy.spatial.distance import cdist
+
+    n_cells = no * no
+    A = np.stack([d.vector for d in desc_a]).reshape(len(desc_a), n_cells, 2, nbins)
+    B = np.stack([d.vector for d in desc_b]).reshape(len(desc_b), n_cells, 2, nbins)
+    A_bright = A[:, :, 0, :].reshape(len(desc_a), -1)
+    A_dark = A[:, :, 1, :].reshape(len(desc_a), -1)
+    B_bright = B[:, :, 0, :].reshape(len(desc_b), -1)
+    B_dark = B[:, :, 1, :].reshape(len(desc_b), -1)
+
+    d_bb = cdist(A_bright, B_bright, metric="sqeuclidean")
+    d_dd = cdist(A_dark, B_dark, metric="sqeuclidean")
+    d_bd = cdist(A_bright, B_dark, metric="sqeuclidean")
+    d_db = cdist(A_dark, B_bright, metric="sqeuclidean")
+    d_ori = np.sqrt(d_bb + d_dd)
+    d_ex = np.sqrt(d_bd + d_db)
+    appearance_dist = np.minimum(d_ori, d_ex)
+
+    context_dist = cdist(context_a, context_b, metric="euclidean")
+    dists = (1.0 - context_weight) * appearance_dist + context_weight * context_dist
+
+    matches: List[Match] = []
+    for i in range(dists.shape[0]):
+        order = np.argsort(dists[i])
+        if len(order) < 2:
+            continue
+        best, second = order[0], order[1]
+        if dists[i, best] < ratio_test * dists[i, second]:
+            back_order = np.argsort(dists[:, best])
+            if back_order[0] == i:
+                matches.append(Match(src_idx=i, dst_idx=int(best), distance=float(dists[i, best])))
+    return matches
+
+
 def swap_aware_match(desc_a: List[BiChannelDescriptor], desc_b: List[BiChannelDescriptor],
                       no: int = 4, nbins: int = 12, ratio_test: float = 0.85) -> List[Match]:
     """Eq 19-21: swap-aware descriptor distance = min(d_ori, d_exchange),

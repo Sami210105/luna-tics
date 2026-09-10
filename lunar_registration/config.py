@@ -97,17 +97,18 @@ class PipelineConfig:
     pwift_min_retention_ratio: float = 0.3
     pwift_keypoint_score_percentile: float = 60.0  # adaptive quality screening - paper describes this qualitatively only
 
-    # ---- displacement-prior pre-filter (new, not in paper) ----
-    # Repetitive crater terrain produces many descriptor matches that pass
-    # the ratio test but are geometrically nonsense (matched to a
-    # similar-looking crater far away). Since src/dst here are the same
-    # sensor/scale/near-nadir framing, correct matches cluster tightly
-    # around a common displacement vector - this prunes matches whose
-    # displacement is a statistical outlier vs that cluster, *before*
-    # RANSAC ever sees them, so RANSAC has a cleaner set to converge on.
-    # Set pwift_max_displacement_px if you know a hard sanity bound
-    # (e.g. from your geo-overlap window math); leave None to skip that
-    # hard cap and rely on the robust (median + MAD) filter alone.
+    # ---- contextual (surrounding-terrain) descriptor - NOT in the paper ----
+    # Off by default so baseline behavior is unchanged. Turn on to test
+    # whether encoding what's AROUND a keypoint (nearby ridge, second
+    # crater, open terrain) resolves "two craters that look identical
+    # locally but sit in different surroundings" - the classic lunar
+    # repetitive-terrain failure mode.
+    pwift_use_context_descriptor: bool = True
+    pwift_context_rings: int = 3
+    pwift_context_sectors: int = 8
+    pwift_context_ring_spacing_px: int = 24
+    pwift_context_weight: float = 0.3   # 0 = pure appearance (= baseline); start here, raise cautiously
+
     pwift_max_displacement_px: "Optional[float]" = None
     pwift_displacement_mad_k: float = 3.0          # robust outlier threshold, in MAD units
     pwift_displacement_min_matches: int = 6        # need at least this many raw matches to trust the stats

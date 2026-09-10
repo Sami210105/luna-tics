@@ -171,10 +171,27 @@ def run_pwift_matching_pw(
         nbins=cfg.pwift_orientations, t=cfg.pwift_bright_dark_threshold,
     )
 
-    matches = pwift_core.swap_aware_match(
-        desc_src, desc_dst, no=cfg.pwift_descriptor_cells, nbins=cfg.pwift_orientations,
-        ratio_test=cfg.pwift_ratio_test,
-    )
+    if cfg.pwift_use_context_descriptor:
+        context_src = pwift_core.compute_context_descriptor(
+            [d.keypoint for d in desc_src], src_maps.M_PW, src_maps.mask,
+            n_rings=cfg.pwift_context_rings, n_sectors=cfg.pwift_context_sectors,
+            ring_spacing_px=cfg.pwift_context_ring_spacing_px,
+        )
+        context_dst = pwift_core.compute_context_descriptor(
+            [d.keypoint for d in desc_dst], dst_maps.M_PW, dst_maps.mask,
+            n_rings=cfg.pwift_context_rings, n_sectors=cfg.pwift_context_sectors,
+            ring_spacing_px=cfg.pwift_context_ring_spacing_px,
+        )
+        matches = pwift_core.swap_aware_match_with_context(
+            desc_src, desc_dst, context_src, context_dst,
+            no=cfg.pwift_descriptor_cells, nbins=cfg.pwift_orientations,
+            ratio_test=cfg.pwift_ratio_test, context_weight=cfg.pwift_context_weight,
+        )
+    else:
+        matches = pwift_core.swap_aware_match(
+            desc_src, desc_dst, no=cfg.pwift_descriptor_cells, nbins=cfg.pwift_orientations,
+            ratio_test=cfg.pwift_ratio_test,
+        )
 
     if not matches:
         return MatchResult("pwift", np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32))
