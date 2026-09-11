@@ -1849,3 +1849,44 @@ def resample_to_gsd(
         .astype(np.float32)
         / 255.0
     )
+
+
+# ----------------------------------------------------------------------
+# GSD-based scale prior (Stage 1.5)
+# ----------------------------------------------------------------------
+
+def estimate_gsd_scale_prior(
+    src: "LoadedImage",
+    ref: "LoadedImage",
+) -> Optional[float]:
+    """Returns a prior estimate of src-vs-ref scale ratio from ground
+    sampling distance metadata, so scale.select_best_scale's coarse-to-fine
+    search (pwift.coarse_to_fine_rotation_scale) can be given a tight band
+    around the physically-expected ratio instead of blindly searching the
+    sensor's full scale_range (e.g. OHRC's 0.5x-3x) from scratch.
+
+    Priority: each image's own measured `gsd_m` (from its label/metadata,
+    when `load_image` was able to populate it) over the sensor's
+    `approx_gsd_m` placeholder from config.py. If NEITHER image has a
+    usable GSD, returns None - callers should fall back to the existing
+    full-range search unchanged.
+
+    Ratio convention matches scale.apply_scale / pwift's scale candidates:
+    a return value of 2.0 means the source image needs to be scaled *up*
+    2x to match the reference's pixel scale (i.e. src has 2x coarser GSD
+    than ref).
+    """
+    src_gsd = src.gsd_m or getattr(src.sensor, "approx_gsd_m", None)
+    ref_gsd = ref.gsd_m or getattr(ref.sensor, "approx_gsd_m", None)
+
+    if not src_gsd or not ref_gsd or src_gsd <= 0 or ref_gsd <= 0:
+        warnings.warn(
+            "estimate_gsd_scale_prior: no usable GSD for source and/or "
+            "reference (checked LoadedImage.gsd_m, then "
+            "SensorConfig.approx_gsd_m) - falling back to an unconstrained "
+            "scale search over the sensor's full scale_range."
+        )
+        return None
+
+    return float(src_gsd / ref_gsd
+    )

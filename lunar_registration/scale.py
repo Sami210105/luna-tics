@@ -12,7 +12,7 @@ in georeference.py.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy import ndimage
@@ -42,22 +42,48 @@ def build_pyramid(img: np.ndarray, sensor: SensorConfig, cfg: PipelineConfig) ->
 
 def select_best_scale(
     src_img: np.ndarray, dst_img: np.ndarray, sensor: SensorConfig, cfg: PipelineConfig,
+    prior_scale: Optional[float] = None, prior_band_frac: float = 0.15,
 ) -> Tuple[float, float]:
-    """Runs the cheap coarse-to-fine correlation search (pwift.py) over the
-    sensor's configured scale range to pick a starting (scale, rotation)
-    estimate before the full matching stage runs. Returns (best_scale,
+    """Runs the cheap coarse-to-fine correlation search (pwift.py) over a
+    set of scale candidates to pick a starting (scale, rotation) estimate
+    before the full matching stage runs. Returns (best_scale,
     best_rotation_deg).
 
-    PERF FIX (this revision): when `sensor.scale_range` is a fixed ratio
-    (lo == hi - e.g. LROC-vs-LROC, scale_range=(1.0, 1.0)), the old code
-    still called `np.geomspace(lo, hi, n)` with `n = max(3, cfg.pyramid_levels)`
-    (4 by default), which for lo==hi produces FOUR IDENTICAL copies of that
-    same scale value. Each one triggered a full, expensive PWIFT coarse-
-    search evaluation of the exact same data - pure wasted work for zero
-    information gain. `build_pyramid` above already had this exact
-    `lo == hi` short-circuit; `select_best_scale` just didn't. Now it does:
-    skip straight to a single-scale rotation-only search."""
+    `prior_scale` (Stage 1.5, preprocessing.estimate_gsd_scale_prior): when
+    given, the search is narrowed to a tight geomspace band of
+    `cfg.pyramid_levels` candidates spanning
+    `prior_scale * (1 +/- prior_band_frac)` (clipped to the sensor's
+    configured `scale_range` so it never searches outside physically
+    plausible bounds for this sensor) instead of the sensor's full range.
+    This is strictly a search-space narrowing, not a hard override - the
+    coarse-to-fine search still picks whichever candidate actually scores
+    best, so a wrong/stale GSD prior costs you search coverage, not
+    correctness, and a bad hit here just means falling back to the wider
+    unconstrained behavior next run. Pass `prior_scale=None` (default) to
+    get the previous, unconstrained behavior unchanged.
+
+    PERF FIX (earlier revision, still applies to the unconstrained path):
+    when `sensor.scale_range` is a fixed ratio (lo == hi - e.g. LROC-vs-
+    LROC, scale_range=(1.0, 1.0)), skip straight to a single-scale
+    rotation-only search rather than evaluating several identical copies
+    of the same scale value."""
     lo, hi = sensor.scale_range
+
+    if prior_scale is not None and prior_scale > 0 and lo != hi:
+        band_lo = max(lo, prior_scale * (1.0 - prior_band_frac))
+        band_hi = min(hi, prior_scale * (1.0 + prior_band_frac))
+        if band_lo < band_hi:
+            n = max(3, cfg.pyramid_levels)
+            scale_candidates = tuple(np.geomspace(band_lo, band_hi, n))
+            return coarse_to_fine_rotation_scale(src_img, dst_img, cfg, scale_candidates=scale_candidates)
+        import warnings
+        warnings.warn(
+            f"select_best_scale: GSD prior scale={prior_scale:.4f} falls "
+            f"outside sensor scale_range={sensor.scale_range} - ignoring "
+            "the prior and falling back to the unconstrained search over "
+            "the full configured range."
+        )
+
     if lo == hi:
         return coarse_to_fine_rotation_scale(src_img, dst_img, cfg, scale_candidates=(lo,))
     n = max(3, cfg.pyramid_levels)

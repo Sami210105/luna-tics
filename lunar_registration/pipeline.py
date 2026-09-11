@@ -45,7 +45,7 @@ import numpy as np
 import cv2
 
 from .config import PipelineConfig, get_sensor_config
-from .preprocessing import load_image, load_angle_maps, LoadedImage
+from .preprocessing import load_image, load_angle_maps, LoadedImage, estimate_gsd_scale_prior
 from .illumination import apply_illumination_correction
 from .scale import select_best_scale, apply_scale, apply_rotation
 from .matching import run_matching
@@ -263,8 +263,16 @@ def run_pipeline(
     # other angle source) was available for it.
     ref_incidence, ref_emission, ref_phase = ref.incidence_deg, ref.emission_deg, ref.phase_deg
 
-    # ---- Stage 5a: pick a starting scale/rotation before matching ----
-    best_scale, best_rot = select_best_scale(src.data, ref.data, src.sensor, cfg)
+    # ---- Stage 1.5: GSD-aware scale prior, then coarse-to-fine search ----
+    # Narrows scale.select_best_scale's search band to what the sensors'
+    # ground sampling distances actually imply, instead of searching the
+    # sensor's full configured scale_range (e.g. OHRC 0.5x-3x) blind. Falls
+    # back to the previous unconstrained behavior automatically if neither
+    # image has usable GSD metadata (see preprocessing.estimate_gsd_scale_prior).
+    gsd_scale_prior = estimate_gsd_scale_prior(src, ref)
+    best_scale, best_rot = select_best_scale(
+        src.data, ref.data, src.sensor, cfg, prior_scale=gsd_scale_prior,
+    )
     src_scaled = apply_scale(src.data, best_scale)
     src_scaled = apply_rotation(src_scaled, best_rot)
     src_incidence_scaled = apply_scale(src_incidence, best_scale) if src_incidence is not None else None
@@ -368,6 +376,7 @@ def run_pipeline(
     summary = {
         "source": source_path, "reference": reference_path,
         "sensor": src.sensor.name, "chosen_scale": best_scale, "chosen_rotation_deg": best_rot,
+        "gsd_scale_prior": gsd_scale_prior,
         "best_method": best_method,
         "metrics": {
             m: {
