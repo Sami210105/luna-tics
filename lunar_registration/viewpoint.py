@@ -44,6 +44,8 @@ class HomographyResult:
     H: Optional[np.ndarray]           # 3x3, or None if estimation failed
     inlier_mask: np.ndarray           # boolean, aligned with input points
     block: Optional[Tuple[int, int, int, int]] = None  # (x, y, w, h) if local
+    Hs_local: Optional[dict] = None   # MiHo quadrant homographies {quad_0: H, ...}
+    gcps: Optional[list] = None       # gridded ground control points
 
 
 def estimate_global_homography(

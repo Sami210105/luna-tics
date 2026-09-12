@@ -144,10 +144,39 @@ class PipelineConfig:
     pwift_search_scales: int = 2
     pwift_search_orientations: int = 6
 
-    # ---- EfficientLoFTR params ----
+    # ---- Modular Matcher & Swappable Models ----
+    matcher_type: str = "hybrid_pwift_roma2"  # "hybrid_pwift_roma2", "hybrid_pwift_eloftr", "roma2", "eloftr", "pwift"
+    device: str = "cuda"                       # auto falls back to cpu if unavailable
+
+    # RoMa v2 fine-tuned model settings
+    roma2_weights_path: Optional[str] = None
+    roma2_max_keypoints: int = 2048
+    roma2_cfg_setting: str = "fast"
+    roma2_tile_size: int = 800
+
+    # EfficientLoFTR fine-tuned model settings
+    eloftr_checkpoint_path: Optional[str] = None
+    eloftr_config_path: Optional[str] = None
     eloftr_model_id: str = "zju-community/efficientloftr"
     eloftr_confidence_threshold: float = 0.2
-    eloftr_device: str = "cpu"  # set to "cuda" if you have a GPU
+    eloftr_device: str = "cpu"
+
+    # ---- Quality-Gated Fusion (§2) ----
+    fusion_alpha: float = 2.0                 # prior radius in ground units (meters)
+    fusion_beta: float = 1.0                  # deduplication radius in ground units (meters)
+    pwift_min_quality_inliers: int = 8       # minimum PWIFT inliers to consider valid
+    pwift_min_quality_cells: int = 3         # minimum occupied 4x4 spatial cells
+    pwift_min_quality_ratio: float = 0.2     # minimum PWIFT inlier ratio
+    pwift_max_quality_rmse_px: float = 15.0  # max acceptable PWIFT reprojection RMSE
+
+    # ---- MiHo & Gridded GCPs (§2) ----
+    miho_grid_size: int = 6                  # 6x6 spatial grid for GCP selection
+    miho_target_gcps: int = 35               # target number of high-utility GCPs
+
+    # ---- Rigid-Only Hypothesis Competition (§4) ----
+    rigid_terrain_spacing_px: float = 24.0   # characteristic crater feature spacing
+    rigid_lambda_dof: float = 0.1            # penalty weight for non-rigid DOF residual
+    rigid_margin_min: float = 0.05           # required margin between competing modes
 
     # ---- RANSAC / homography ----
     ransac_reproj_threshold_px: float = 3.0

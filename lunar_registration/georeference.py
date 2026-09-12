@@ -96,6 +96,23 @@ def register_image(
         return warp_local(src_img, homography_result, ref_shape)
     if homography_result.H is None:
         raise RuntimeError("Homography estimation failed - no transform to warp with.")
+
+    # If MiHo 2x2 local quadrant homographies exist, blend them across quadrants
+    if getattr(homography_result, "Hs_local", None) and len(homography_result.Hs_local) == 4:
+        sh, sw = src_img.shape[:2]
+        hw, hh = sw // 2, sh // 2
+        quad_blocks = [
+            (0, 0, hw, hh),
+            (hw, 0, sw - hw, hh),
+            (0, hh, hw, sh - hh),
+            (hw, hh, sw - hw, sh - hh),
+        ]
+        miho_results = []
+        for q in range(4):
+            H_q = homography_result.Hs_local.get(f"quad_{q}", homography_result.H)
+            miho_results.append(HomographyResult(H=H_q, inlier_mask=homography_result.inlier_mask, block=quad_blocks[q]))
+        return warp_local(src_img, miho_results, ref_shape)
+
     return warp_global(src_img, homography_result.H, ref_shape)
 
 

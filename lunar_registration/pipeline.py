@@ -36,10 +36,14 @@ angle maps, etc).
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import warnings
 from typing import Optional, Tuple
+
+# Optimize PyTorch CUDA allocator to prevent OOM fragmentation on constrained GPUs
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import cv2
@@ -48,7 +52,10 @@ from .config import PipelineConfig, get_sensor_config
 from .preprocessing import load_image, load_angle_maps, LoadedImage, estimate_gsd_scale_prior
 from .illumination import apply_illumination_correction
 from .scale import select_best_scale, apply_scale, apply_rotation
-from .matching import run_matching
+from .matching import get_matcher, run_pwift_matching, MatchResult, BaseMatcher
+from .fusion import fuse_pwift_neural, miho_plus_gcp, assess_pwift_quality
+from .verify import compute_structural_ncc, compete_rigid, gate_cheap
+from .refine import refine_tile, choose_refiner, compute_texture_energy
 from .viewpoint import estimate_viewpoint_transform, HomographyResult
 from .georeference import register_image, write_outputs
 from .metrics import compute_metrics
@@ -60,111 +67,6 @@ def _parse_window(s: Optional[str]) -> Optional[Tuple[int, int, int, int]]:
         return None
     x, y, w, h = (int(v) for v in s.split(","))
     return x, y, w, h
-
-
-def filter_eloftr_with_pwift(pwift_result, eloftr_result, cfg: PipelineConfig):
-    """Approach A: PWIFT-only geometry filters EfficientLoFTR, then fuse."""
-    if pwift_result is None or eloftr_result is None:
-        return None
-
-    if len(pwift_result.pts_src) < 4 or len(eloftr_result.pts_src) == 0:
-        return None
-
-    prior_threshold = float(
-        getattr(cfg, "pwift_eloftr_prior_threshold_px", 5.0)
-    )
-    dedupe_radius = float(
-        getattr(cfg, "pwift_eloftr_dedupe_radius_px", 2.0)
-    )
-
-    # Preliminary model comes ONLY from PWIFT.
-    H_pwift, pwift_inliers = cv2.findHomography(
-        pwift_result.pts_src.astype(np.float32),
-        pwift_result.pts_dst.astype(np.float32),
-        cv2.RANSAC,
-        float(cfg.ransac_reproj_threshold_px),
-        maxIters=int(cfg.ransac_max_iters),
-        confidence=float(cfg.ransac_confidence),
-    )
-
-    if H_pwift is None or pwift_inliers is None:
-        warnings.warn("PWIFT -> LoFTR fusion skipped: no PWIFT homography.")
-        return None
-
-    if int(np.count_nonzero(pwift_inliers)) < 4:
-        warnings.warn("PWIFT -> LoFTR fusion skipped: fewer than 4 PWIFT inliers.")
-        return None
-
-    src_l = eloftr_result.pts_src.astype(np.float32)
-    dst_l = eloftr_result.pts_dst.astype(np.float32)
-
-    predicted = cv2.perspectiveTransform(
-        src_l.reshape(-1, 1, 2), H_pwift
-    ).reshape(-1, 2)
-
-    error = np.linalg.norm(predicted - dst_l, axis=1)
-    keep = np.isfinite(error) & (error <= prior_threshold)
-
-    n_prior = int(keep.sum())
-
-    # Remove LoFTR correspondences already represented by PWIFT anchors.
-    candidate_idx = np.flatnonzero(keep)
-    if len(candidate_idx):
-        src_delta = (
-            src_l[candidate_idx, None, :]
-            - pwift_result.pts_src[None, :, :]
-        )
-        dst_delta = (
-            dst_l[candidate_idx, None, :]
-            - pwift_result.pts_dst[None, :, :]
-        )
-
-        duplicate = (
-            np.linalg.norm(src_delta, axis=2) <= dedupe_radius
-        ) & (
-            np.linalg.norm(dst_delta, axis=2) <= dedupe_radius
-        )
-        keep[candidate_idx] &= ~np.any(duplicate, axis=1)
-
-    kept = np.flatnonzero(keep)
-
-    fused_src = np.concatenate(
-        [pwift_result.pts_src, src_l[kept]], axis=0
-    ).astype(np.float32)
-    fused_dst = np.concatenate(
-        [pwift_result.pts_dst, dst_l[kept]], axis=0
-    ).astype(np.float32)
-
-    pwift_scores = (
-        pwift_result.scores
-        if pwift_result.scores is not None
-        else np.ones(len(pwift_result.pts_src), dtype=np.float32)
-    )
-    loftr_scores = (
-        eloftr_result.scores[kept]
-        if eloftr_result.scores is not None
-        else np.ones(len(kept), dtype=np.float32)
-    )
-    fused_scores = np.concatenate(
-        [pwift_scores, loftr_scores], axis=0
-    ).astype(np.float32)
-
-    from .matching import MatchResult
-
-    print(
-        f"[FUSION] PWIFT anchors: {len(pwift_result.pts_src)} | "
-        f"LoFTR candidates: {len(eloftr_result.pts_src)} | "
-        f"within PWIFT prior: {n_prior} | "
-        f"after dedupe: {len(kept)} | "
-        f"fused: {len(fused_src)}"
-    )
-
-    return MatchResult(
-        "pwift_eloftr_fused",
-        fused_src,
-        fused_dst,
-        fused_scores,
-    )
 
 
 def run_pipeline(
@@ -186,16 +88,34 @@ def run_pipeline(
     window: Optional[Tuple[int, int, int, int]] = None,
     source_window: Optional[Tuple[int, int, int, int]] = None,
     reference_window: Optional[Tuple[int, int, int, int]] = None,
+    matcher: Optional[str] = None,
+    roma2_weights: Optional[str] = None,
+    eloftr_checkpoint: Optional[str] = None,
+    eloftr_ckpt: Optional[str] = None,
+    device: Optional[str] = None,
     use_eloftr: bool = True,
     fuse_pwift_eloftr: bool = False,
     cfg: Optional[PipelineConfig] = None,
 ) -> dict:
     cfg = cfg or PipelineConfig()
 
-    # `--window` remains as a backward-compatible shorthand for a shared
-    # crop. For two independently acquired LROC NAC observations, use
-    # source_window/reference_window: the same lunar terrain generally has
-    # different pixel coordinates in the two images.
+    if eloftr_ckpt:
+        eloftr_checkpoint = eloftr_ckpt
+    if roma2_weights:
+        cfg.roma2_weights_path = roma2_weights
+    if eloftr_checkpoint:
+        cfg.eloftr_checkpoint_path = eloftr_checkpoint
+    if device:
+        cfg.device = device
+
+    if matcher is None:
+        if fuse_pwift_eloftr:
+            matcher = "hybrid_pwift_eloftr"
+        elif not use_eloftr:
+            matcher = "pwift"
+        else:
+            matcher = getattr(cfg, "matcher_type", "hybrid_pwift_roma2")
+
     if source_window is None:
         source_window = window
     if reference_window is None:
@@ -218,19 +138,6 @@ def run_pipeline(
         nac_pho_band_incidence=nac_pho_band_incidence,
     )
 
-    # ---- BUGFIX (this revision): fail fast and clearly on oversized images ----
-    # pwift.py's photometric_weighted_structural_maps (the PWIFT branch used
-    # for OHRC/LROC) allocates several full-resolution float64/complex128
-    # buffers per (scale, orientation) pass - up to
-    # cfg.pwift_scales * cfg.pwift_orientations of them. Running this on a
-    # raw, uncropped LROC NAC strip (tens of millions of pixels) can require
-    # 60-100+ GB of RAM and previously crashed with a bare
-    # numpy.core._exceptions._ArrayMemoryError several calls deep inside
-    # pwift.py, with no indication of *why* or what to do about it. The
-    # paper's own benchmark only ever runs PWIFT on 512x512 patches (see
-    # PWIFT.pdf Sec 4.1) - this is a --window problem, not a bug in the
-    # matching code, so surface it as one clearly instead of letting the
-    # allocation itself be the first sign anything is wrong.
     _MAX_SAFE_PIXELS = 4_000_000  # ~2000x2000
     if window is None:
         for _tag, _loaded in (("source", src), ("reference", ref)):
@@ -242,11 +149,7 @@ def run_pipeline(
                     "Running the full illumination/matching stage at this "
                     "resolution will very likely exhaust memory. Pass "
                     "--source-window x,y,w,h and --reference-window x,y,w,h "
-                    "to crop the common geographic overlap "
-                    "overlap region (roughly 512x512 up to ~2048x2048, "
-                    "depending on available RAM) before matching - see "
-                    "preview_overlap.py to find good coordinates for your "
-                    "specific image pair."
+                    "to crop the common geographic overlap region."
                 )
 
     src_incidence, src_emission, src_phase = src.incidence_deg, src.emission_deg, src.phase_deg
@@ -255,20 +158,9 @@ def run_pipeline(
             source_incidence_path, source_emission_path,
             source_phase_path or source_emission_path, window=source_window,
         )
-    # The reference image (LROC, illumination_method="pwift_akimov" same as
-    # OHRC) needs its own photometric weighting too - PWIFT's structural
-    # maps (Sec 3.2-3.3) are built independently per image. Previously only
-    # the source ever received incidence/emission/phase, so the reference
-    # silently ran unweighted PWIFT even when `--reference-nac-pho` (or any
-    # other angle source) was available for it.
     ref_incidence, ref_emission, ref_phase = ref.incidence_deg, ref.emission_deg, ref.phase_deg
 
     # ---- Stage 1.5: GSD-aware scale prior, then coarse-to-fine search ----
-    # Narrows scale.select_best_scale's search band to what the sensors'
-    # ground sampling distances actually imply, instead of searching the
-    # sensor's full configured scale_range (e.g. OHRC 0.5x-3x) blind. Falls
-    # back to the previous unconstrained behavior automatically if neither
-    # image has usable GSD metadata (see preprocessing.estimate_gsd_scale_prior).
     gsd_scale_prior = estimate_gsd_scale_prior(src, ref)
     best_scale, best_rot = select_best_scale(
         src.data, ref.data, src.sensor, cfg, prior_scale=gsd_scale_prior,
@@ -283,9 +175,6 @@ def run_pipeline(
     src_phase_scaled = apply_rotation(src_phase_scaled, best_rot) if src_phase_scaled is not None else None
 
     # ---- Stage 2: illumination correction (per-sensor branch) ----
-    # Returns a pwift.PWIFTMaps bundle for OHRC/LROC (Sec 3.2-3.3 of
-    # PWIFT.pdf), or a plain ndarray for TMC/IIRS - matching.py dispatches
-    # on which one it got.
     src_illum = apply_illumination_correction(
         src_scaled, src.sensor, incidence_deg=src_incidence_scaled,
         emission_deg=src_emission_scaled, phase_deg=src_phase_scaled,
@@ -297,22 +186,71 @@ def run_pipeline(
         n_scales=cfg.pwift_scales, n_orient=cfg.pwift_orientations, cfg=cfg,
     )
 
-    # ---- Stage 3: matching (PWIFT + EfficientLoFTR) ----
-    pwift_result, eloftr_result = run_matching(
-        src_illum, src_scaled, ref_illum, ref.data, cfg, use_eloftr=use_eloftr,
-    )
+    # ---- Stage 3: matching & fusion (Modular, Swappable) ----
+    results_to_evaluate: List[MatchResult] = []
 
-    # Approach A: use PWIFT geometry to filter LoFTR, then fuse.
-    fused_result = None
-    if fuse_pwift_eloftr and eloftr_result is not None:
-        fused_result = filter_eloftr_with_pwift(
-            pwift_result, eloftr_result, cfg
-        )
+    if matcher.startswith("hybrid_pwift_"):
+        neural_name = matcher.replace("hybrid_pwift_", "")
+        pw_matcher = get_matcher("pwift", cfg)
+        try:
+            pw_res = pw_matcher.match(src_scaled, ref.data, src_illum=src_illum, ref_illum=ref_illum)
+        finally:
+            del pw_matcher
+
+        neural_res = None
+        n_matcher = None
+        try:
+            n_matcher = get_matcher(neural_name, cfg)
+            neural_res = n_matcher.match(src_scaled, ref.data)
+        except Exception as e:
+            warnings.warn(f"Neural matcher '{neural_name}' unavailable ({e}); falling back to PWIFT only.")
+        finally:
+            if n_matcher is not None:
+                del n_matcher
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+            gc.collect()
+
+        if neural_res is not None and len(neural_res.pts_src) >= 4:
+            fused_res = fuse_pwift_neural(
+                pw_res, neural_res,
+                gsd_ref=ref.gsd_m or 1.0,
+                alpha=cfg.fusion_alpha,
+                beta=cfg.fusion_beta,
+                pwift_n_min=cfg.pwift_min_quality_inliers,
+                pwift_c_min=cfg.pwift_min_quality_cells,
+                pwift_r_min=cfg.pwift_min_quality_ratio,
+                pwift_rmse_max_px=cfg.pwift_max_quality_rmse_px,
+            )
+            results_to_evaluate.extend([fused_res, neural_res, pw_res])
+        else:
+            results_to_evaluate.append(pw_res)
+    else:
+        m = get_matcher(matcher, cfg)
+        try:
+            res = m.match(src_scaled, ref.data, src_illum=src_illum, ref_illum=ref_illum)
+            results_to_evaluate.append(res)
+        finally:
+            del m
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ImportError:
+                pass
+            gc.collect()
 
     results_by_method = {}
-    for match_result in [pwift_result, eloftr_result, fused_result]:
+    competition_pool = []
+
+    for match_result in results_to_evaluate:
         if match_result is None or len(match_result.pts_src) < 4:
             continue
+
         # ---- Stage 4: viewpoint (homography + RANSAC) ----
         hom_result = estimate_viewpoint_transform(
             match_result.pts_src, match_result.pts_dst, src.sensor,
@@ -326,9 +264,6 @@ def run_pipeline(
                 inlier_mask |= r.inlier_mask
 
         # ---- Eq 26-27: explicit homography-based reprojection cleanup ----
-        # Tightens (never loosens) the FSC inlier mask above - a match must
-        # be both an FSC inlier AND within tau_e of its own block's/the
-        # global H's reprojection to survive.
         tau_e = cfg.reprojection_cleanup_tau_e_px
         if isinstance(hom_result, list):
             clean_mask = np.zeros(len(match_result.pts_src), dtype=bool)
@@ -343,24 +278,65 @@ def run_pipeline(
             clean = reprojection_cleanup(match_result.pts_src, match_result.pts_dst, hom_result.H, tau_e)
             inlier_mask = inlier_mask & clean
 
+        primary_H = hom_result.H if not isinstance(hom_result, list) else (hom_result[0].H if hom_result else None)
+
         metrics = compute_metrics(
             match_result.method, match_result.pts_src, match_result.pts_dst,
             inlier_mask, H_or_local_results, image_shape=src_scaled.shape, grid=cfg.uniformity_grid,
         )
-        results_by_method[match_result.method] = {
-            "match_result": match_result, "hom_result": hom_result,
-            "inlier_mask": inlier_mask, "metrics": metrics,
+
+        # Structural fit and non-rigid DOF residual for rigid competition
+        s_ncc = compute_structural_ncc(src_scaled, ref.data, primary_H) if primary_H is not None else 0.0
+        coverage = float(metrics.uniformity_score)
+        dof_resid = 0.0
+        if primary_H is not None and len(match_result.pts_src) > 0:
+            proj = cv2.perspectiveTransform(
+                match_result.pts_src.reshape(-1, 1, 2).astype(np.float32), primary_H.astype(np.float32)
+            ).reshape(-1, 2)
+            dof_resid = float(np.median(np.abs(proj - match_result.pts_dst)))
+
+        candidate_entry = {
+            "method": match_result.method,
+            "match_result": match_result,
+            "hom_result": hom_result,
+            "inlier_mask": inlier_mask,
+            "metrics": metrics,
+            "warp": primary_H if primary_H is not None else np.eye(3),
+            "fit": s_ncc,
+            "coverage": coverage,
+            "dof_resid": dof_resid,
         }
+        results_by_method[match_result.method] = candidate_entry
+        competition_pool.append(candidate_entry)
 
     if not results_by_method:
         raise RuntimeError(
-            "No usable matches from either PWIFT or EfficientLoFTR. Check "
-            "input images / thresholds (config.py: pwift_bg_threshold, "
-            "eloftr_confidence_threshold)."
+            f"No usable matches from {matcher}. Check input images / thresholds."
         )
 
-    best_method = max(results_by_method, key=lambda m: results_by_method[m]["metrics"].n_inliers)
+    # Rigid-only hypothesis competition (§4)
+    comp_res = compete_rigid(
+        competition_pool,
+        terrain_spacing_px=cfg.rigid_terrain_spacing_px,
+        lambda_dof=cfg.rigid_lambda_dof,
+        margin_min=cfg.rigid_margin_min,
+    )
+    best_method = comp_res["winner"]["method"]
     best = results_by_method[best_method]
+
+    # ---- Stage 5: MiHo Piecewise Geometry + 6x6 Gridded GCP Optimizer (§2) ----
+    primary_H = best["hom_result"].H if not isinstance(best["hom_result"], list) else best["hom_result"][0].H
+    miho_out = miho_plus_gcp(primary_H, best["match_result"], grid_size=cfg.miho_grid_size, target_gcps=cfg.miho_target_gcps)
+
+    if not isinstance(best["hom_result"], list):
+        best["hom_result"].Hs_local = miho_out.get("Hs_local")
+        best["hom_result"].gcps = miho_out.get("gcps")
+
+    # ---- Stage 5.5: Cause-Branched Subpixel Refinement (§5) ----
+    src_inc_mean = float(np.nanmean(src_incidence_scaled)) if src_incidence_scaled is not None else 0.0
+    ref_inc_mean = float(np.nanmean(ref_incidence)) if ref_incidence is not None else 0.0
+    illum_delta_deg = abs(src_inc_mean - ref_inc_mean)
+    subpixel_refine_out = refine_tile(src_scaled, ref.data, illum_delta_deg=illum_delta_deg)
 
     # ---- Stage 6: georeferencing and output ----
     registered = register_image(src_scaled, ref.data.shape, best["hom_result"])
@@ -375,9 +351,25 @@ def run_pipeline(
 
     summary = {
         "source": source_path, "reference": reference_path,
-        "sensor": src.sensor.name, "chosen_scale": best_scale, "chosen_rotation_deg": best_rot,
+        "sensor": src.sensor.name, "matcher": matcher, "best_method": best_method,
+        "provenance": getattr(best["match_result"], "provenance", "direct"),
+        "chosen_scale": best_scale, "chosen_rotation_deg": best_rot,
         "gsd_scale_prior": gsd_scale_prior,
-        "best_method": best_method,
+        "rigid_competition": {
+            "margin": comp_res.get("margin", 0.0),
+            "ambiguous": comp_res.get("ambiguous", False),
+        },
+        "miho_gcps": {
+            "count": len(miho_out.get("gcps", [])),
+            "coverage": miho_out.get("coverage", 0.0),
+            "gcps": miho_out.get("gcps", [])[:5],
+        },
+        "subpixel_refine": {
+            "method": subpixel_refine_out.get("method"),
+            "dx": subpixel_refine_out.get("dx"),
+            "dy": subpixel_refine_out.get("dy"),
+            "low_precision": subpixel_refine_out.get("low_precision", False),
+        },
         "metrics": {
             m: {
                 "n_matches": r["metrics"].n_matches, "n_inliers": r["metrics"].n_inliers,
@@ -400,63 +392,60 @@ def main():
     parser.add_argument("--reference", required=True)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--source-sensor", default=None, choices=["OHRC", "TMC", "IIRS", "LROC"])
+    parser.add_argument(
+        "--matcher", default=None,
+        choices=["hybrid_pwift_roma2", "hybrid_pwift_eloftr", "roma2", "eloftr", "pwift"],
+        help="Matcher model to use. Defaults to hybrid_pwift_roma2.",
+    )
+    parser.add_argument("--roma2-weights", default=None, help="Path to fine-tuned RoMa v2 weights")
+    parser.add_argument("--eloftr-ckpt", default=None, help="Path to fine-tuned EfficientLoFTR checkpoint")
+    parser.add_argument("--device", default=None, choices=["cuda", "cpu"], help="Inference device")
     parser.add_argument("--source-incidence", default=None)
     parser.add_argument("--source-emission", default=None)
     parser.add_argument("--source-phase", default=None)
     parser.add_argument("--source-nac-pho", default=None,
-                         help="Path to the source image's LROC NAC_PHO photometry "
-                              "cube (or a GeoTIFF exported from one). Reads real "
-                              "pixel-wise incidence/emission/phase from its angle "
-                              "bands - see preprocessing.load_angles_from_nac_pho. "
-                              "Takes priority over --incidence-deg/--angles-from-label.")
+                         help="Path to the source image's LROC NAC_PHO photometry cube.")
     parser.add_argument("--reference-nac-pho", default=None,
-                         help="Same as --source-nac-pho, but for the reference "
-                              "(LROC) image. The reference also uses PWIFT's "
-                              "photometric weighting, so it benefits from its own "
-                              "NAC_PHO angle maps just like the source does.")
+                         help="Path to the reference image's LROC NAC_PHO photometry cube.")
     parser.add_argument("--nac-pho-band-phase", type=int, default=2)
     parser.add_argument("--nac-pho-band-emission", type=int, default=3)
     parser.add_argument("--nac-pho-band-incidence", type=int, default=4)
     parser.add_argument("--angles-from-label", action="store_true")
     parser.add_argument("--fetch-lroc-angles", action="store_true",
-                         help="Auto-fetch incidence/emission/phase from the LROC ODE "
-                              "product page (data.lroc.im-ldi.com) by product ID derived "
-                              "from --source's filename. Requires `pip install requests` "
-                              "and internet access. Overridden by --incidence-deg/etc if given.")
+                         help="Auto-fetch incidence/emission/phase from the LROC ODE page.")
     parser.add_argument("--incidence-deg", type=float, default=None,
-                         help="Manually supply the source image's incidence angle in "
-                              "degrees (e.g. from the LROC ODE page or a paper's Table 1). "
-                              "Takes priority over --fetch-lroc-angles/--angles-from-label.")
+                         help="Manually supply the source image's incidence angle in degrees.")
     parser.add_argument("--emission-deg", type=float, default=None,
                          help="Manually supply the source image's emission angle in degrees.")
     parser.add_argument("--phase-deg", type=float, default=None,
-                         help="Manually supply the source image's phase angle in degrees (optional).")
+                         help="Manually supply the source image's phase angle in degrees.")
     parser.add_argument(
         "--window", default=None,
-        help="Backward-compatible shared x,y,w,h crop. Prefer separate "
-             "--source-window and --reference-window for LROC/LROC pairs.",
+        help="Backward-compatible shared x,y,w,h crop.",
     )
     parser.add_argument(
         "--source-window", default=None,
-        help="Source-image crop x,y,w,h (recommended for geometry-selected LROC overlap).",
+        help="Source-image crop x,y,w,h.",
     )
     parser.add_argument(
         "--reference-window", default=None,
-        help="Reference-image crop x,y,w,h (recommended for geometry-selected LROC overlap).",
+        help="Reference-image crop x,y,w,h.",
     )
-    parser.add_argument("--no-eloftr", action="store_true")
+    parser.add_argument("--no-eloftr", action="store_true", help="Shorthand to run PWIFT only")
     parser.add_argument(
         "--fuse-pwift-eloftr",
         action="store_true",
-        help="Approach A: filter EfficientLoFTR using a PWIFT-only "
-             "preliminary homography, then fuse surviving LoFTR matches "
-             "with PWIFT anchors before final RANSAC.",
+        help="Shorthand for --matcher hybrid_pwift_eloftr",
     )
     args = parser.parse_args()
 
     summary = run_pipeline(
         source_path=args.source, reference_path=args.reference, out_dir=args.out_dir,
         source_sensor=args.source_sensor,
+        matcher=args.matcher,
+        roma2_weights=args.roma2_weights,
+        eloftr_checkpoint=args.eloftr_ckpt,
+        device=args.device,
         source_incidence_path=args.source_incidence, source_emission_path=args.source_emission,
         source_phase_path=args.source_phase,
         source_nac_pho_path=args.source_nac_pho, reference_nac_pho_path=args.reference_nac_pho,

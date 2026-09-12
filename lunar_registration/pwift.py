@@ -181,7 +181,10 @@ def akimov_weight(incidence_deg: np.ndarray, emission_deg: np.ndarray,
 
     lo = float(w0[valid].min())
     hi = float(w0[valid].max())
-    w = (w0 - lo) / (hi - lo + eps)
+    if (hi - lo) < 1e-4:
+        w = w0
+    else:
+        w = (w0 - lo) / (hi - lo + eps)
     w = np.where(valid, np.clip(w, 0.0, 1.0), 0.0)
     return w.astype(np.float32)
 
@@ -1025,31 +1028,23 @@ def fsc_homography(
     pts_a: np.ndarray, pts_b: np.ndarray,
     reproj_threshold: float = 3.0, max_iters: int = 2000, confidence: float = 0.999,
 ):
-    """RANSAC-based homography estimation with an extra iterative-refit pass
-    (fit -> drop worst outlier -> refit) approximating the paper's FSC
-    consensus + reprojection cleanup step. Requires OpenCV."""
+    """Homography estimation via MAGSAC++ (cv2.USAC_MAGSAC) with continuous
+    residual density estimation. Requires OpenCV."""
     import cv2
 
-    if len(pts_a) < 4:
+    if len(pts_a) < 4 or len(pts_b) < 4:
         return None, np.zeros(len(pts_a), dtype=bool)
 
+    method = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)
     H, mask = cv2.findHomography(
-        pts_a, pts_b, cv2.RANSAC, reproj_threshold,
-        maxIters=max_iters, confidence=confidence,
+        pts_a.astype(np.float32),
+        pts_b.astype(np.float32),
+        method=method,
+        ransacReprojThreshold=reproj_threshold,
+        maxIters=max_iters,
+        confidence=confidence,
     )
     mask = mask.ravel().astype(bool) if mask is not None else np.zeros(len(pts_a), dtype=bool)
-
-    if H is not None and mask.sum() >= 4:
-        H2, mask2 = cv2.findHomography(
-            pts_a[mask], pts_b[mask], cv2.RANSAC, reproj_threshold * 0.75,
-            maxIters=max_iters, confidence=confidence,
-        )
-        if H2 is not None:
-            full_mask = np.zeros(len(pts_a), dtype=bool)
-            idx = np.nonzero(mask)[0]
-            full_mask[idx[mask2.ravel().astype(bool)]] = True
-            return H2, full_mask
-
     return H, mask
 
 
