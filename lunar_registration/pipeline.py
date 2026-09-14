@@ -225,6 +225,12 @@ def run_pipeline(
                 pwift_c_min=cfg.pwift_min_quality_cells,
                 pwift_r_min=cfg.pwift_min_quality_ratio,
                 pwift_rmse_max_px=cfg.pwift_max_quality_rmse_px,
+                src_illum=src_illum,
+                ref_illum=ref_illum,
+                verify_photometric=cfg.fusion_verify_photometric,
+                patch_radius=cfg.fusion_verification_patch_r,
+                min_energy_thresh=cfg.fusion_verification_min_energy,
+                reject_thresh=cfg.fusion_verification_reject_thresh,
             )
             results_to_evaluate.extend([fused_res, neural_res, pw_res])
         else:

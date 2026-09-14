@@ -168,6 +168,10 @@ class PipelineConfig:
     pwift_min_quality_cells: int = 3         # minimum occupied 4x4 spatial cells
     pwift_min_quality_ratio: float = 0.2     # minimum PWIFT inlier ratio
     pwift_max_quality_rmse_px: float = 15.0  # max acceptable PWIFT reprojection RMSE
+    fusion_verify_photometric: bool = True   # enable PWIFT photometric & structural verification
+    fusion_verification_patch_r: int = 4     # local patch radius (9x9 window)
+    fusion_verification_min_energy: float = 0.02  # min local phase energy to trigger structural check (abstain below)
+    fusion_verification_reject_thresh: float = 0.1  # consistency score threshold to prune blatant contradictions
 
     # ---- MiHo & Gridded GCPs (§2) ----
     miho_grid_size: int = 6                  # 6x6 spatial grid for GCP selection

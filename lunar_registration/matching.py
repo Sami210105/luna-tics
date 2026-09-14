@@ -359,7 +359,9 @@ class _AutocastDisabledTorch:
     @staticmethod
     def autocast(*args, **kwargs):
         import torch
-        kwargs["enabled"] = False
+        device_type = kwargs.get("device_type", args[0] if args else "cuda")
+        if device_type != "cuda":
+            kwargs["enabled"] = False
         return torch.autocast(*args, **kwargs)
 
 
@@ -399,6 +401,10 @@ class Roma2Matcher(BaseMatcher):
             for name, module in list(sys.modules.items()):
                 if (name == "romav2" or name.startswith("romav2.")) and getattr(module, "torch", None) is torch:
                     module.torch = _AutocastDisabledTorch()
+        else:
+            for name, module in list(sys.modules.items()):
+                if (name == "romav2" or name.startswith("romav2.")) and isinstance(getattr(module, "torch", None), _AutocastDisabledTorch):
+                    module.torch = torch
 
         from romav2 import RoMaV2
         try:
@@ -520,6 +526,10 @@ class Roma2Matcher(BaseMatcher):
                         ten0 = self._prepare_tensor(im0)
                         ten1 = self._prepare_tensor(im1)
                         preds = self.model.match(ten0, ten1)
+
+                if isinstance(preds, dict):
+                    preds = {k: v.float() if isinstance(v, torch.Tensor) else v for k, v in preds.items()}
+
                 matches, confidence, _, _ = self.model.sample(preds, kpts_per_tile)
                 mkpts0, mkpts1 = self.model.to_pixel_coordinates(matches, th0, tw0, th1, tw1)
 

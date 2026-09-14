@@ -164,15 +164,22 @@ def akimov_weight(incidence_deg: np.ndarray, emission_deg: np.ndarray,
     limb pixels (incidence or emission >= 90 deg is treated as invalid, per
     Eq 1's "invalid pixels -> w0=0") and optionally applies phase-angle
     darkening if a phase map is available."""
-    mu0 = np.cos(np.radians(incidence_deg))
-    mu = np.cos(np.radians(emission_deg))
-    valid = (mu0 > 0) & (mu > 0) & np.isfinite(mu0) & np.isfinite(mu)
+    valid = (
+        (incidence_deg >= 0.0) & (incidence_deg < 90.0) &
+        (emission_deg >= 0.0) & (emission_deg < 90.0) &
+        np.isfinite(incidence_deg) & np.isfinite(emission_deg)
+    )
+    if phase_deg is not None:
+        valid = valid & (phase_deg >= 0.0) & (phase_deg <= 180.0) & np.isfinite(phase_deg)
+
+    mu0 = np.cos(np.radians(np.where(valid, incidence_deg, 0.0)))
+    mu = np.cos(np.radians(np.where(valid, emission_deg, 0.0)))
 
     mu0_c = np.clip(mu0, eps, 1.0)
     mu_c = np.clip(mu, eps, 1.0)
     w0 = (2 * mu0_c) / (mu0_c + mu_c)
     if phase_deg is not None:
-        w0 = w0 * np.cos(np.radians(np.clip(phase_deg, 0, 180)) / 2.0) ** 2
+        w0 = w0 * np.cos(np.radians(np.clip(np.where(valid, phase_deg, 0.0), 0, 180)) / 2.0) ** 2
 
     w0 = np.where(valid, w0, 0.0)
 

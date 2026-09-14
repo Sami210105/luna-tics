@@ -1,0 +1,73 @@
+{
+  "timestamp": "2026-09-14T04:14:33.462176",
+  "num_pairs": 20,
+  "device": "cuda",
+  "models_evaluated": [
+    "roma2_finetuned",
+    "eloftr_finetuned",
+    "pwift+eloftr_finetuned",
+    "pwift+roma2_finetuned"
+  ],
+  "leaderboard": [
+    {
+      "Model": "roma2_finetuned",
+      "Avg Candidates": 2048.0,
+      "Avg Inliers": 1982.75,
+      "Inlier Ratio (%)": 96.81396484375,
+      "MMA@1px (%)": 94.3173334546236,
+      "MMA@3px (%)": 94.98361858798945,
+      "RMSE (px)": 1.752408307728811,
+      "Corner Err (px)": 0.13304927602021266,
+      "SSIM": 0.8553721368312835,
+      "PSNR (dB)": 22.49364093590586,
+      "NCC": 0.9655568336089855,
+      "Match Latency (ms)": 641.7258775014488,
+      "Total Latency (ms)": 642.7036509016034
+    },
+    {
+      "Model": "eloftr_finetuned",
+      "Avg Candidates": 2425.75,
+      "Avg Inliers": 2231.25,
+      "Inlier Ratio (%)": 81.91908501572283,
+      "MMA@1px (%)": 77.41906506589503,
+      "MMA@3px (%)": 87.71776814842262,
+      "RMSE (px)": 6.44817213294593,
+      "Corner Err (px)": 0.22426284639955407,
+      "SSIM": 0.8364126920700073,
+      "PSNR (dB)": 21.8634058706893,
+      "NCC": 0.9098750243961712,
+      "Match Latency (ms)": 190.43782170119812,
+      "Total Latency (ms)": 191.72881340127788
+    },
+    {
+      "Model": "pwift+eloftr_finetuned",
+      "Avg Candidates": 2484.9,
+      "Avg Inliers": 2294.15,
+      "Inlier Ratio (%)": 82.24799350963893,
+      "MMA@1px (%)": 77.15704459558741,
+      "MMA@3px (%)": 88.29400653651601,
+      "RMSE (px)": 6.2666997496744425,
+      "Corner Err (px)": 0.21272490217435763,
+      "SSIM": 0.8405896782875061,
+      "PSNR (dB)": 22.033038539668695,
+      "NCC": 0.923749580154715,
+      "Match Latency (ms)": 3715.981414698763,
+      "Total Latency (ms)": 3717.2111580479395
+    },
+    {
+      "Model": "pwift+roma2_finetuned",
+      "Avg Candidates": 2115.7,
+      "Avg Inliers": 2038.35,
+      "Inlier Ratio (%)": 96.24659319957662,
+      "MMA@1px (%)": 93.21303517153214,
+      "MMA@3px (%)": 94.87451523853402,
+      "RMSE (px)": 1.9296624050742097,
+      "Corner Err (px)": 0.13016653895734814,
+      "SSIM": 0.8552404016256332,
+      "PSNR (dB)": 22.47429772395531,
+      "NCC": 0.959370342516767,
+      "Match Latency (ms)": 493.4468196002854,
+      "Total Latency (ms)": 494.51169230087544
+    }
+  ]
+}
