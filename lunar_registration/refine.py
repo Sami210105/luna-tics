@@ -87,6 +87,11 @@ def refine_tile(
     g0 = _to_gray(tile_src)
     g1 = _to_gray(tile_ref)
 
+    # Ensure matching spatial dimensions for ECC and phase correlation
+    h1, w1 = g1.shape[:2]
+    if g0.shape[:2] != (h1, w1):
+        g0 = cv2.resize(g0, (w1, h1), interpolation=cv2.INTER_LINEAR)
+
     if method in ("skip", "coarse_inflated"):
         return {
             "dx": 0.0,

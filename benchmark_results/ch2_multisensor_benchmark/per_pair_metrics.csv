@@ -1,0 +1,5 @@
+pair_id,track,sensor,scene_id,model,regime,candidates,inliers,inlier_ratio_pct,mma1_pct,mma2_pct,mma3_pct,mma5_pct,rmse_px,corner_err_px,ssim,psnr_db,ncc,uniformity,t_neural_ms,t_pwift_ms,t_fusion_ms,t_match_total_ms,t_ransac_ms,t_total_ms
+tmc_optical_pair_000,tmc_optical,TMC,01_apollo11_mare_tranquillitatis,eloftr_finetuned,moderate,3314,3285,99.125,90.046,99.117,100.000,100.000,0.677,0.133,0.937,20.225,0.988,0.796,371.397,0.000,0.000,371.397,1.749,373.146
+tmc_optical_pair_001,tmc_optical,TMC,01_apollo11_mare_tranquillitatis,eloftr_finetuned,moderate,3371,3295,97.745,89.621,98.300,100.000,100.000,0.701,0.293,0.943,35.293,0.995,0.813,96.943,0.000,0.000,96.943,1.681,98.624
+tmc_optical_pair_000,tmc_optical,TMC,01_apollo11_mare_tranquillitatis,pwift,moderate,275,267,97.091,89.139,98.502,100.000,100.000,0.692,0.181,0.936,20.217,0.988,0.612,0.000,3848.330,0.000,3848.330,0.328,3848.658
+tmc_optical_pair_001,tmc_optical,TMC,01_apollo11_mare_tranquillitatis,pwift,moderate,419,413,98.568,89.588,99.031,100.000,100.000,0.707,0.132,0.945,35.543,0.995,0.647,0.000,3908.346,0.000,3908.346,0.364,3908.710

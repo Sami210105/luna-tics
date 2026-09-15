@@ -30,7 +30,7 @@ from __future__ import annotations
 import csv
 import os
 import warnings
-from typing import List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import cv2
@@ -116,6 +116,23 @@ def register_image(
     return warp_global(src_img, homography_result.H, ref_shape)
 
 
+def _pixel_to_geo(px: float, py: float, transform=None, crs=None) -> Tuple[float, float]:
+    """Converts pixel coordinate (px, py) to geographic/selenographic coordinate (lon, lat)."""
+    if transform is not None:
+        try:
+            if hasattr(transform, "__mul__"):
+                gx, gy = transform * (px, py)
+                return float(gx), float(gy)
+            elif isinstance(transform, (list, tuple)) and len(transform) == 6:
+                c, a, b, f, d, e = transform
+                gx = c + a * px + b * py
+                gy = f + d * px + e * py
+                return float(gx), float(gy)
+        except Exception:
+            pass
+    return float(px), float(py)
+
+
 def write_outputs(
     out_dir: str, tag: str,
     registered_img: np.ndarray,
@@ -124,12 +141,18 @@ def write_outputs(
     src_img: Optional[np.ndarray] = None,
     ref_img: Optional[np.ndarray] = None,
     save_visualization: bool = True,
+    gcps: Optional[List[Dict[str, Any]]] = None,
+    export_gcl_gcps_csv: bool = True,
 ) -> dict:
     """`src_img`/`ref_img`, if provided, are the pre-warp images (at the
     resolution matching was run on - e.g. pipeline.py's `src_scaled` and
     `ref.data`) used only to render the match-point visualization PNG; they
     don't affect registration itself. Pass `save_visualization=False` to
-    skip it."""
+    skip it.
+    
+    If `gcps` is provided and `export_gcl_gcps_csv` is True, exports
+    `{tag}_gcl_gcps.csv` containing the Ground Control Lattice GCPs.
+    """
     os.makedirs(out_dir, exist_ok=True)
     png_path = os.path.join(out_dir, f"{tag}_registered.png")
     csv_path = os.path.join(out_dir, f"{tag}_matchpoints.csv")
@@ -153,6 +176,35 @@ def write_outputs(
             writer.writerow([sx, sy, dx, dy, int(bool(inl)), method])
 
     outputs = {"registered_png": png_path, "matchpoints_csv": csv_path}
+
+    if export_gcl_gcps_csv and gcps:
+        gcp_csv_path = os.path.join(out_dir, f"{tag}_gcl_gcps.csv")
+        with open(gcp_csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "gcp_id", "src_x", "src_y", "ref_x", "ref_y",
+                "gcs_lon", "gcs_lat", "inlier", "cell_x", "cell_y", "confidence"
+            ])
+            for i, gcp in enumerate(gcps):
+                pt_src = gcp.get("pt_src", [0.0, 0.0])
+                pt_dst = gcp.get("pt_dst", [0.0, 0.0])
+                sx, sy = float(pt_src[0]), float(pt_src[1])
+                rx, ry = float(pt_dst[0]), float(pt_dst[1])
+                glon, glat = _pixel_to_geo(rx, ry, ref_geotransform, ref_crs)
+
+                inl = 1
+                if "inlier" in gcp:
+                    inl = int(bool(gcp["inlier"]))
+                elif "residual" in gcp:
+                    inl = 1 if float(gcp["residual"]) <= 3.0 else 0
+
+                cell = gcp.get("cell", (0, 0))
+                cx, cy = int(cell[0]), int(cell[1])
+                conf = float(gcp.get("utility", gcp.get("score", 1.0)))
+
+                writer.writerow([i, sx, sy, rx, ry, glon, glat, inl, cx, cy, conf])
+
+        outputs["gcl_gcps_csv"] = gcp_csv_path
 
     if save_visualization and src_img is not None and ref_img is not None and len(pts_src):
         viz_path = os.path.join(out_dir, f"{tag}_matches.png")

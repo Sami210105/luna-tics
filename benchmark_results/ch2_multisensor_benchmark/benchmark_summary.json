@@ -1,0 +1,52 @@
+{
+  "timestamp": "2026-09-15T14:29:52.818979",
+  "tracks_evaluated": [
+    "tmc_optical"
+  ],
+  "total_pairs": 2,
+  "device": "cuda",
+  "models_evaluated": [
+    "eloftr_finetuned",
+    "pwift"
+  ],
+  "leaderboard": [
+    {
+      "Model": "eloftr_finetuned",
+      "Avg Candidates": 3342.5,
+      "Avg Inliers": 3290.0,
+      "Inlier Ratio (%)": 98.43520034115402,
+      "MMA@1px (%)": 89.83314971487172,
+      "MMA@3px (%)": 100.0,
+      "RMSE (px)": 0.6888259898325517,
+      "Corner Err (px)": 0.21307517242184124,
+      "SSIM": 0.9400983154773712,
+      "PSNR (dB)": 27.75873404709391,
+      "NCC": 0.9912225161311758,
+      "Spatial Uniformity": 0.8043427296793229,
+      "Neural Latency (ms)": 234.17001850248198,
+      "PWIFT Latency (ms)": 0.0,
+      "Fusion Latency (ms)": 0.0,
+      "Total Match Latency (ms)": 234.17001850248198,
+      "End-to-End Latency (ms)": 235.8848795047379
+    },
+    {
+      "Model": "pwift",
+      "Avg Candidates": 347.0,
+      "Avg Inliers": 340.0,
+      "Inlier Ratio (%)": 97.82946409199393,
+      "MMA@1px (%)": 89.36347725149858,
+      "MMA@3px (%)": 100.0,
+      "RMSE (px)": 0.6994770458439931,
+      "Corner Err (px)": 0.1563013169254791,
+      "SSIM": 0.940337747335434,
+      "PSNR (dB)": 27.87986486838054,
+      "NCC": 0.9915236057909891,
+      "Spatial Uniformity": 0.6292468527180632,
+      "Neural Latency (ms)": 0.0,
+      "PWIFT Latency (ms)": 3878.3382139954483,
+      "Fusion Latency (ms)": 0.0,
+      "Total Match Latency (ms)": 3878.3382139954483,
+      "End-to-End Latency (ms)": 3878.683809994982
+    }
+  ]
+}

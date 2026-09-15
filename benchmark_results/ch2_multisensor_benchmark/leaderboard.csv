@@ -1,0 +1,3 @@
+Model,Avg Candidates,Avg Inliers,Inlier Ratio (%),MMA@1px (%),MMA@3px (%),RMSE (px),Corner Err (px),SSIM,PSNR (dB),NCC,Spatial Uniformity,Neural Latency (ms),PWIFT Latency (ms),Fusion Latency (ms),Total Match Latency (ms),End-to-End Latency (ms)
+eloftr_finetuned,3342.500,3290.000,98.435,89.833,100.000,0.689,0.213,0.940,27.759,0.991,0.804,234.170,0.000,0.000,234.170,235.885
+pwift,347.000,340.000,97.829,89.363,100.000,0.699,0.156,0.940,27.880,0.992,0.629,0.000,3878.338,0.000,3878.338,3878.684

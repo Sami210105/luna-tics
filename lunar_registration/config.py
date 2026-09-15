@@ -145,7 +145,7 @@ class PipelineConfig:
     pwift_search_orientations: int = 6
 
     # ---- Modular Matcher & Swappable Models ----
-    matcher_type: str = "hybrid_pwift_roma2"  # "hybrid_pwift_roma2", "hybrid_pwift_eloftr", "roma2", "eloftr", "pwift"
+    matcher_type: str = "auto"  # "auto", "hybrid_pwift_roma2", "hybrid_pwift_eloftr", "roma2", "eloftr", "pwift"
     device: str = "cuda"                       # auto falls back to cpu if unavailable
 
     # RoMa v2 fine-tuned model settings
@@ -195,3 +195,13 @@ class PipelineConfig:
 
     # ---- uniformity metric grid ----
     uniformity_grid: int = 8
+
+    # ---- Condition-Based Adaptive Workflow ----
+    polar_incidence_threshold_deg: float = 70.0  # extreme polar grazing sun threshold
+    real_time_mode: bool = False                 # operational flag for real-time descent TRN
+    real_time_target_fps: float = 10.0          # throughput threshold
+    enable_orthogonal_gate: bool = True          # enable gate_cheap in consensus
+    orthogonal_gate_t_struct: float = 0.40       # structural gradient NCC threshold
+    orthogonal_gate_tau_agree: float = 24.0      # max translation discrepancy with 256px phase shift
+    orthogonal_gate_k_sigma: float = 3.0         # scale prior consistency tolerance
+    export_gcl_gcps_csv: bool = True             # export {tag}_gcl_gcps.csv

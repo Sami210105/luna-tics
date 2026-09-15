@@ -40,7 +40,7 @@ import gc
 import json
 import os
 import warnings
-from typing import Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # Optimize PyTorch CUDA allocator to prevent OOM fragmentation on constrained GPUs
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -69,6 +69,74 @@ def _parse_window(s: Optional[str]) -> Optional[Tuple[int, int, int, int]]:
     return x, y, w, h
 
 
+def determine_adaptive_matcher(
+    requested_matcher: Optional[str],
+    incidence_deg: Optional[float],
+    real_time: bool,
+    cfg: PipelineConfig,
+) -> Tuple[str, Dict[str, Any]]:
+    """Determines the matcher and operational regime based on physical & operational conditions.
+
+    Returns:
+        (resolved_matcher_name, routing_metadata)
+    """
+    clean = (requested_matcher or "auto").strip().lower()
+
+    if clean != "auto":
+        return clean, {
+            "mode": "manual_override",
+            "regime": "user_specified",
+            "incidence_deg": incidence_deg,
+            "real_time_requested": real_time,
+            "resolved_matcher": clean,
+            "reason": f"Explicit user override: {clean}",
+        }
+
+    inc = incidence_deg if incidence_deg is not None else 30.0
+
+    # Condition 1: Extreme Polar / Grazing Sun (i >= 70°)
+    if inc >= cfg.polar_incidence_threshold_deg:
+        chosen = "hybrid_pwift_eloftr" if real_time else "hybrid_pwift_roma2"
+        return chosen, {
+            "mode": "adaptive",
+            "regime": "polar_grazing",
+            "incidence_deg": inc,
+            "real_time_requested": real_time,
+            "resolved_matcher": chosen,
+            "reason": (
+                f"Incidence {inc:.1f}° >= {cfg.polar_incidence_threshold_deg:.1f}°: "
+                "PWIFT harmonic Akimov masking suppresses migrating shadow boundaries."
+            ),
+        }
+
+    # Condition 2: Real-Time Operational Constraint (Descent TRN)
+    if real_time or cfg.real_time_mode:
+        return "eloftr", {
+            "mode": "adaptive",
+            "regime": "real_time_trn",
+            "incidence_deg": inc,
+            "real_time_requested": True,
+            "resolved_matcher": "eloftr",
+            "reason": (
+                "Real-time descent navigation constraint requested: "
+                "EfficientLoFTR selected for ~88 ms latency and high inlier density."
+            ),
+        }
+
+    # Condition 3: Sub-Pixel Surface Cartography (Nominal)
+    return "roma2", {
+        "mode": "adaptive",
+        "regime": "subpixel_cartography",
+        "incidence_deg": inc,
+        "real_time_requested": False,
+        "resolved_matcher": "roma2",
+        "reason": (
+            "Nominal orbital mapping: RoMa v2 selected for sub-pixel precision "
+            "(79.9% MMA@1px, 0.10 px corner error)."
+        ),
+    }
+
+
 def run_pipeline(
     source_path: str, reference_path: str, out_dir: str,
     source_sensor: Optional[str] = None,
@@ -95,6 +163,10 @@ def run_pipeline(
     device: Optional[str] = None,
     use_eloftr: bool = True,
     fuse_pwift_eloftr: bool = False,
+    real_time: bool = False,
+    enable_orthogonal_gate: Optional[bool] = None,
+    polar_incidence_threshold_deg: Optional[float] = None,
+    export_gcl_gcps_csv: Optional[bool] = None,
     cfg: Optional[PipelineConfig] = None,
 ) -> dict:
     cfg = cfg or PipelineConfig()
@@ -107,6 +179,14 @@ def run_pipeline(
         cfg.eloftr_checkpoint_path = eloftr_checkpoint
     if device:
         cfg.device = device
+    if real_time:
+        cfg.real_time_mode = True
+    if enable_orthogonal_gate is not None:
+        cfg.enable_orthogonal_gate = enable_orthogonal_gate
+    if polar_incidence_threshold_deg is not None:
+        cfg.polar_incidence_threshold_deg = polar_incidence_threshold_deg
+    if export_gcl_gcps_csv is not None:
+        cfg.export_gcl_gcps_csv = export_gcl_gcps_csv
 
     if matcher is None:
         if fuse_pwift_eloftr:
@@ -114,7 +194,7 @@ def run_pipeline(
         elif not use_eloftr:
             matcher = "pwift"
         else:
-            matcher = getattr(cfg, "matcher_type", "hybrid_pwift_roma2")
+            matcher = getattr(cfg, "matcher_type", "auto")
 
     if source_window is None:
         source_window = window
@@ -160,6 +240,22 @@ def run_pipeline(
         )
     ref_incidence, ref_emission, ref_phase = ref.incidence_deg, ref.emission_deg, ref.phase_deg
 
+    # Resolve adaptive matcher based on physical and operational conditions
+    inc_for_routing = None
+    if manual_incidence_deg is not None:
+        inc_for_routing = float(manual_incidence_deg)
+    elif src_incidence is not None:
+        inc_for_routing = float(np.nanmean(src_incidence))
+    elif src.incidence_deg is not None:
+        inc_for_routing = float(np.nanmean(src.incidence_deg))
+
+    resolved_matcher, routing_info = determine_adaptive_matcher(
+        requested_matcher=matcher,
+        incidence_deg=inc_for_routing,
+        real_time=real_time or cfg.real_time_mode,
+        cfg=cfg,
+    )
+
     # ---- Stage 1.5: GSD-aware scale prior, then coarse-to-fine search ----
     gsd_scale_prior = estimate_gsd_scale_prior(src, ref)
     best_scale, best_rot = select_best_scale(
@@ -186,11 +282,17 @@ def run_pipeline(
         n_scales=cfg.pwift_scales, n_orient=cfg.pwift_orientations, cfg=cfg,
     )
 
-    # ---- Stage 3: matching & fusion (Modular, Swappable) ----
+    # ---- Stage 3: matching & fusion (Modular, Swappable with Contingency Fallback) ----
     results_to_evaluate: List[MatchResult] = []
+    contingency_fallback = {
+        "triggered": False,
+        "original_matcher": resolved_matcher,
+        "fallback_matcher": None,
+        "reason": None,
+    }
 
-    if matcher.startswith("hybrid_pwift_"):
-        neural_name = matcher.replace("hybrid_pwift_", "")
+    if resolved_matcher.startswith("hybrid_pwift_"):
+        neural_name = resolved_matcher.replace("hybrid_pwift_", "")
         pw_matcher = get_matcher("pwift", cfg)
         try:
             pw_res = pw_matcher.match(src_scaled, ref.data, src_illum=src_illum, ref_illum=ref_illum)
@@ -204,6 +306,12 @@ def run_pipeline(
             neural_res = n_matcher.match(src_scaled, ref.data)
         except Exception as e:
             warnings.warn(f"Neural matcher '{neural_name}' unavailable ({e}); falling back to PWIFT only.")
+            contingency_fallback = {
+                "triggered": True,
+                "original_matcher": resolved_matcher,
+                "fallback_matcher": "pwift",
+                "reason": str(e),
+            }
         finally:
             if n_matcher is not None:
                 del n_matcher
@@ -234,14 +342,60 @@ def run_pipeline(
             )
             results_to_evaluate.extend([fused_res, neural_res, pw_res])
         else:
+            if neural_res is not None and len(neural_res.pts_src) < 4 and not contingency_fallback["triggered"]:
+                contingency_fallback = {
+                    "triggered": True,
+                    "original_matcher": resolved_matcher,
+                    "fallback_matcher": "pwift",
+                    "reason": f"Neural matcher '{neural_name}' yielded < 4 matches; degraded to PWIFT only.",
+                }
             results_to_evaluate.append(pw_res)
     else:
-        m = get_matcher(matcher, cfg)
+        m = None
         try:
+            m = get_matcher(resolved_matcher, cfg)
             res = m.match(src_scaled, ref.data, src_illum=src_illum, ref_illum=ref_illum)
-            results_to_evaluate.append(res)
+            if (res is None or len(res.pts_src) < 4) and resolved_matcher != "pwift":
+                warnings.warn(
+                    f"Matcher '{resolved_matcher}' returned insufficient matches "
+                    f"({len(res.pts_src) if res is not None else 0} < 4); "
+                    "triggering contingency fallback to PWIFT standalone."
+                )
+                contingency_fallback = {
+                    "triggered": True,
+                    "original_matcher": resolved_matcher,
+                    "fallback_matcher": "pwift",
+                    "reason": f"Insufficient matches from {resolved_matcher} (< 4 points)",
+                }
+                pw_matcher = get_matcher("pwift", cfg)
+                try:
+                    res = pw_matcher.match(src_scaled, ref.data, src_illum=src_illum, ref_illum=ref_illum)
+                finally:
+                    del pw_matcher
+            if res is not None:
+                results_to_evaluate.append(res)
+        except Exception as e:
+            if resolved_matcher != "pwift":
+                warnings.warn(
+                    f"Matcher '{resolved_matcher}' failed ({e}); triggering contingency fallback to PWIFT standalone."
+                )
+                contingency_fallback = {
+                    "triggered": True,
+                    "original_matcher": resolved_matcher,
+                    "fallback_matcher": "pwift",
+                    "reason": str(e),
+                }
+                pw_matcher = get_matcher("pwift", cfg)
+                try:
+                    res = pw_matcher.match(src_scaled, ref.data, src_illum=src_illum, ref_illum=ref_illum)
+                    results_to_evaluate.append(res)
+                finally:
+                    del pw_matcher
+            else:
+                raise
         finally:
-            del m
+            if m is not None:
+                del m
             try:
                 import torch
                 if torch.cuda.is_available():
@@ -317,7 +471,7 @@ def run_pipeline(
 
     if not results_by_method:
         raise RuntimeError(
-            f"No usable matches from {matcher}. Check input images / thresholds."
+            f"No usable matches from {resolved_matcher} (requested: {matcher}). Check input images / thresholds."
         )
 
     # Rigid-only hypothesis competition (§4)
@@ -330,8 +484,29 @@ def run_pipeline(
     best_method = comp_res["winner"]["method"]
     best = results_by_method[best_method]
 
+    # ---- Orthogonal Verification Gate (gate_cheap) ----
+    primary_H = best["hom_result"].H if not isinstance(best["hom_result"], list) else (
+        best["hom_result"][0].H if best["hom_result"] else None
+    )
+    ortho_eval = None
+    if cfg.enable_orthogonal_gate and primary_H is not None:
+        ortho_eval = gate_cheap(
+            primary_H,
+            src_scaled,
+            ref.data,
+            gsd_src=src.gsd_m or 1.0,
+            gsd_ref=ref.gsd_m or 1.0,
+            t_struct=cfg.orthogonal_gate_t_struct,
+            tau_agree=cfg.orthogonal_gate_tau_agree,
+            k_sigma=cfg.orthogonal_gate_k_sigma,
+        )
+        if not ortho_eval.get("pass", False):
+            warnings.warn(
+                f"Orthogonal verification gate flagged winning transform: {ortho_eval.get('reason')}. "
+                "Proceeding with flagged confidence."
+            )
+
     # ---- Stage 5: MiHo Piecewise Geometry + 6x6 Gridded GCP Optimizer (§2) ----
-    primary_H = best["hom_result"].H if not isinstance(best["hom_result"], list) else best["hom_result"][0].H
     miho_out = miho_plus_gcp(primary_H, best["match_result"], grid_size=cfg.miho_grid_size, target_gcps=cfg.miho_target_gcps)
 
     if not isinstance(best["hom_result"], list):
@@ -353,11 +528,23 @@ def run_pipeline(
         inlier_mask=best["inlier_mask"], method=best_method,
         ref_geotransform=ref.geotransform, ref_crs=ref.crs,
         src_img=src_scaled, ref_img=ref.data,
+        gcps=miho_out.get("gcps", []),
+        export_gcl_gcps_csv=cfg.export_gcl_gcps_csv,
     )
 
     summary = {
         "source": source_path, "reference": reference_path,
-        "sensor": src.sensor.name, "matcher": matcher, "best_method": best_method,
+        "sensor": src.sensor.name, "matcher": matcher, "resolved_matcher": resolved_matcher,
+        "best_method": best_method,
+        "condition_routing": routing_info,
+        "contingency_fallback": contingency_fallback,
+        "orthogonal_gate": {
+            "enabled": cfg.enable_orthogonal_gate,
+            "passed": ortho_eval.get("pass", False) if ortho_eval is not None else True,
+            "reason": ortho_eval.get("reason", "disabled") if ortho_eval is not None else "disabled",
+            "cost_ms": ortho_eval.get("cost_ms", 0.0) if ortho_eval is not None else 0.0,
+            "struct_ncc": ortho_eval.get("struct_ncc", 0.0) if ortho_eval is not None else 0.0,
+        },
         "provenance": getattr(best["match_result"], "provenance", "direct"),
         "chosen_scale": best_scale, "chosen_rotation_deg": best_rot,
         "gsd_scale_prior": gsd_scale_prior,
@@ -368,6 +555,7 @@ def run_pipeline(
         "miho_gcps": {
             "count": len(miho_out.get("gcps", [])),
             "coverage": miho_out.get("coverage", 0.0),
+            "csv_path": outputs.get("gcl_gcps_csv"),
             "gcps": miho_out.get("gcps", [])[:5],
         },
         "subpixel_refine": {
@@ -399,9 +587,21 @@ def main():
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--source-sensor", default=None, choices=["OHRC", "TMC", "IIRS", "LROC"])
     parser.add_argument(
-        "--matcher", default=None,
-        choices=["hybrid_pwift_roma2", "hybrid_pwift_eloftr", "roma2", "eloftr", "pwift"],
-        help="Matcher model to use. Defaults to hybrid_pwift_roma2.",
+        "--matcher", default="auto",
+        choices=["auto", "hybrid_pwift_roma2", "hybrid_pwift_eloftr", "roma2", "eloftr", "pwift"],
+        help="Matcher model to use. Defaults to 'auto' for condition-based adaptive dispatch.",
+    )
+    parser.add_argument(
+        "--real-time", "--descent-trn", action="store_true", dest="real_time",
+        help="Enable real-time descent TRN mode (routes to EfficientLoFTR).",
+    )
+    parser.add_argument(
+        "--polar-threshold-deg", type=float, default=70.0,
+        help="Solar incidence angle threshold (deg) for extreme polar grazing illumination routing.",
+    )
+    parser.add_argument(
+        "--disable-orthogonal-gate", action="store_true",
+        help="Disable the orthogonal verification gate (gate_cheap).",
     )
     parser.add_argument("--roma2-weights", default=None, help="Path to fine-tuned RoMa v2 weights")
     parser.add_argument("--eloftr-ckpt", default=None, help="Path to fine-tuned EfficientLoFTR checkpoint")
@@ -449,6 +649,9 @@ def main():
         source_path=args.source, reference_path=args.reference, out_dir=args.out_dir,
         source_sensor=args.source_sensor,
         matcher=args.matcher,
+        real_time=args.real_time,
+        enable_orthogonal_gate=not args.disable_orthogonal_gate,
+        polar_incidence_threshold_deg=args.polar_threshold_deg,
         roma2_weights=args.roma2_weights,
         eloftr_checkpoint=args.eloftr_ckpt,
         device=args.device,

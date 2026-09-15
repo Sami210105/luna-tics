@@ -26,3 +26,16 @@ Thumbs.db
 
 # Environment / secrets
 .env
+
+# Data archives
+*.zip
+
+# Architecture and diagram images
+*architecture*.png
+*flowchart*.png
+*diagram*.png
+architecture_block_diagram.png
+flowchart_architecture.png
+pipeline_process_block_diagram.png
+process_block_diagram.png
+ppt_architecture_benchmark_diagram.png
